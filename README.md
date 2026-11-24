@@ -1,0 +1,1 @@
+# high-currency-speculative-method
