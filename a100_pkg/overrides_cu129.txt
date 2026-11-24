@@ -1,0 +1,7 @@
+torch==2.13.0+cu129
+torchvision==0.28.0+cu129
+torchaudio==2.11.0+cu129
+sglang-kernel==0.4.6.post1+cu129
+flashinfer_python==0.6.18
+nvidia-cutlass-dsl==4.6.2
+cuda-python==12.9.*
