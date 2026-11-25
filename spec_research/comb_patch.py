@@ -4,26 +4,41 @@
 # comb: the drafter runs the plain topk=1 chain (trunk); the top-K of every draft distribution along the trunk
 # is kept, trunk siblings become leaves, and the top-B nodes by cumulative draft score (B = num_steps, the same
 # verify width as the chain) are verified as a tree.
-# Originals are saved as *.pre-comb; refuses to patch twice.
+# Originals are saved as *.pre-comb. Files that already contain their edits are skipped, so re-running on a runtime
+# patched by an older version of this script only adds what that version did not cover. Nothing is written unless
+# every file matches.
 # Usage: python comb_patch.py /home/lrz/AI_infra/experiments/runtime/sglang/srt
 import os, shutil, sys
 
 SRT = sys.argv[1]
 
 
+pending = []  # (rel, path, patched source), written together by apply()
+
+
 def patch(rel, edits):
     path = os.path.join(SRT, rel)
-    if os.path.exists(path + ".pre-comb"):
-        sys.exit(f"{rel}: already patched ({rel}.pre-comb exists)")
     src = open(path).read()
+    if all(new in src for _, new in edits):
+        print(f"skip {rel}: already patched")
+        return
     for old, new in edits:
         n = src.count(old)
         if n != 1:
             sys.exit(f"{rel}: expected 1 match, found {n}:\n{old}")
         src = src.replace(old, new)
-    shutil.copy2(path, path + ".pre-comb")
-    open(path, "w").write(src)
-    print("patched", rel)
+    pending.append((rel, path, src))
+
+
+def apply():
+    for rel, path, src in pending:
+        shutil.copy2(path, path + ".pre-comb")
+        # replace instead of writing in place: installers such as uv hard-link files to a shared cache
+        shutil.copy2(path, path + ".comb-tmp")
+        with open(path + ".comb-tmp", "w") as f:
+            f.write(src)
+        os.replace(path + ".comb-tmp", path)
+        print("patched", rel)
 
 
 patch("speculative/eagle_worker_v2.py", [
@@ -160,3 +175,28 @@ patch("speculative/eagle_draft_cuda_graph_runner.py", [
             topk_p = torch.zeros((self.max_bs, topk_width), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, topk_width), dtype=torch.int64)'''),
 ])
+
+# Hybrid linear-attention targets (GDN, e.g. Qwen3.5): the linear layers carry recurrent state, so a custom mask is not
+# enough to verify a tree. With topk=1 they skip the parent links and run the N verify tokens as one chain, which feeds
+# the trunk's siblings into the state of every later node.
+patch("layers/attention/hybrid_linear_attn_backend.py", [
+    ("import logging\nfrom typing import TYPE_CHECKING, Optional, Union\n",
+     "import logging\nimport os\nfrom typing import TYPE_CHECKING, Optional, Union\n"),
+    # self.topk only selects chain vs tree target verify in this backend
+    ("        self.topk = get_spec().speculative_eagle_topk or 0\n",
+     '''        self.topk = max(
+            get_spec().speculative_eagle_topk or 0,
+            int(os.environ.get("SGLANG_COMB_K", "0")),
+        )
+'''),
+])
+
+# The deduplicated conv window overlaps consecutive verify steps, which is only valid for a linear chain.
+patch("mem_cache/memory_pool.py", [
+    ("        and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)\n",
+     '''        and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
+        and int(os.environ.get("SGLANG_COMB_K", "0")) <= 1
+'''),
+])
+
+apply()
