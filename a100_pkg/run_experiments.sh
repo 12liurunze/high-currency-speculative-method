@@ -21,7 +21,8 @@ run_budget() {  # $1=N $2=bs list $3=RUN_AR ; reps outermost so drift spreads ov
   done
 }
 
-run_budget $N0 $BS_ALL 1
+# SKIP_N0=1: budget-N0 results already in $OUT, go straight to the budget shrink
+[ "${SKIP_N0:-0}" = 1 ] || run_budget $N0 $BS_ALL 1
 LOSE=$($PY $WORK/losing_bs.py $OUT $N0 $BS_ALL)
 for N in $(seq $((N0 - 1)) -1 $MIN_N); do
   echo "N=$((N + 1)) tree does not beat chain at bs: [$LOSE] $(date)"

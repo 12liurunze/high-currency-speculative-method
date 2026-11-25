@@ -22,7 +22,7 @@ for bs in sorted({k[0] for k in tab}):
         note = ""
         ar = tab.get((bs, "ar", c))
         if ar and t != "ar": note += f"  x{m / ar[0][0]:.2f} vs AR"
-        if t.startswith("tree"):
-            ch = tab.get((bs, t.replace("tree", "chain"), c))
+        if t.startswith(("tree", "comb")):
+            ch = tab.get((bs, "chain_" + t.split("_", 1)[1], c))
             if ch: note += f"  x{m / ch[0][0]:.2f} vs chain"
         print(f"{(c or 'ALL'):15s} {t:10s} {m:9.1f} +- {s:6.1f} {al:6.2f} {n:3d}{note}")

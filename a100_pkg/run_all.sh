@@ -1,6 +1,10 @@
 #!/bin/bash
 # One server config at a time: start server -> bench all bs in the list -> stop server; runs ar, chain_N<N>, tree_N<N>.
-# Usage: [TP=8] [REP=1] [RUN_AR=1] [COPIES=auto] [RESUME=0] [OUT=file] [EXTRA="--kv-cache-dtype fp8_e4m3"] bash run_all.sh <eagle|mtp> [budgets] [bs_list]
+# Usage: [TP=8] [REP=1] [RUN_AR=1] [ONLY=tags] [TREE_K=ks] [COPIES=auto] [RESUME=0] [OUT=file] [EXTRA="--kv-cache-dtype fp8_e4m3"] bash run_all.sh <eagle|mtp> [budgets] [bs_list]
+# COMB=1 also runs comb_N<N> (HedgeTree: topk=1 chain drafter + COMB_K (default 4) siblings per trunk position,
+# same verify budget N; needs the comb-patched SGLang runtime, enabled per server via SGLANG_COMB_K)
+# Optional hooks (shell commands): PRE_LAUNCH runs right before each server start, POST_STOP right after it is stopped
+# (e.g. release / re-grab a GPU placeholder on a shared machine). Both are empty by default.
 set -u
 WORK=${WORK:-$(cd $(dirname $0) && pwd)}; MODELS=${MODELS:-$WORK/models}
 [ -f $WORK/env.sh ] && source $WORK/env.sh
@@ -31,23 +35,27 @@ stop_server() {  # $1=pid of the server's process group leader (started with set
 }
 
 run_cfg() {  # $1=tag $2=extra server args
+  # ONLY="tag1 tag2": run just these configs (empty = all)
+  if [ -n "${ONLY:-}" ] && ! echo " $ONLY " | grep -q " $1 "; then return; fi
   if curl -s -m 2 localhost:$PORT/health >/dev/null; then echo "port $PORT busy (another server/run_all running?) - abort"; exit 1; fi
   # unique per (tag, rep, max bs, KV dtype) so later runs never overwrite earlier logs
   local kvt=bf16; case "${EXTRA:-}" in *fp8*) kvt=fp8;; esac
   local log=$WORK/logs/server_${WHICH}_$1_rep${REP}_bs${MAXBS}_${kvt}.log; mkdir -p $WORK/logs
+  [ -n "${PRE_LAUNCH:-}" ] && eval "$PRE_LAUNCH"
   # own process group, so stop_server can take down every TP worker
-  setsid $PY -m sglang.launch_server --model-path $MODEL --trust-remote-code --tp-size $TP --port $PORT \
+  SGLANG_COMB_K=${COMB_K_CFG:-0} setsid $PY -m sglang.launch_server --model-path $MODEL --trust-remote-code --tp-size $TP --port $PORT \
     --mem-fraction-static $MEM --max-running-requests $MAXBS --cuda-graph-max-bs-decode $MAXBS \
     --disable-radix-cache $BASE ${EXTRA:-} $2 > $log 2>&1 &
   local pid=$!
-  for i in $(seq 900); do
+  for i in $(seq $(( ${START_TIMEOUT:-1800} / 2 ))); do  # seconds to wait for the server (slow disks: raise it)
     curl -s -m 2 localhost:$PORT/health >/dev/null && break
-    kill -0 $pid 2>/dev/null || { echo "{\"tag\":\"$1\",\"rep\":$REP,\"bs_list\":\"$BS\",\"error\":\"server died, see $log\"}" | tee -a $OUT; stop_server $pid; return; }
+    kill -0 $pid 2>/dev/null || { echo "{\"tag\":\"$1\",\"rep\":$REP,\"bs_list\":\"$BS\",\"error\":\"server died, see $log\"}" | tee -a $OUT; stop_server $pid; [ -n "${POST_STOP:-}" ] && eval "$POST_STOP"; return; }
     sleep 2
   done
   $PY $WORK/bench.py --port $PORT --model $MODEL --tag $1 --rep $REP --bs $BS --copies $COPIES $RES_FLAG --max-new $MAXNEW \
     --out $OUT --data $DATA --chat-kwargs "$CHAT_KW" --server-log $log
   stop_server $pid
+  [ -n "${POST_STOP:-}" ] && eval "$POST_STOP"
 }
 
 [ ${RUN_AR:-1} = 1 ] && run_cfg ar ""
@@ -55,5 +63,8 @@ for N in $BUDGETS; do
   run_cfg chain_N$N "$SPEC --speculative-num-steps $((N-1)) --speculative-eagle-topk 1 --speculative-num-draft-tokens $N"
   # tree: depth = width = N-1, same verify budget N; N=8 -> (7,7,8)
   [ $N -ge 3 ] && run_cfg tree_N$N "$SPEC --speculative-num-steps $((N-1)) --speculative-eagle-topk $((N-1)) --speculative-num-draft-tokens $N"
+  # TREE_K="2 ...": extra trees at the same depth N-1 / budget N with topk K, tagged tree_N<N>_k<K> (ignored by losing_bs.py)
+  for K in ${TREE_K:-}; do [ $N -ge 3 ] && run_cfg tree_N${N}_k$K "$SPEC --speculative-num-steps $((N-1)) --speculative-eagle-topk $K --speculative-num-draft-tokens $N"; done
+  [ "${COMB:-0}" = 1 ] && COMB_K_CFG=${COMB_K:-4} run_cfg comb_N$N "$SPEC --speculative-num-steps $((N-1)) --speculative-eagle-topk 1 --speculative-num-draft-tokens $N"
 done
 echo ALL_DONE
