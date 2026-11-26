@@ -75,7 +75,7 @@
 
 - 优先使用机器上已有的、满足要求的环境；否则在**独立 venv** 中安装 `sglang==0.5.23`（不要改系统 Python）。驱动的 CUDA 版本低于 torch 编译版本时，按 sglang 官方安装说明选对应 CUDA 版本的 wheel。
 - 必须包含 `qwen3_5.py` / `qwen3_5_mtp.py`（`check_env.sh` 会检查）。sglang 版本不是 0.5.23 时可以继续，但必须写进报告。
-- **comb 补丁**：对实验用的 SGLang 运行一次（只需一次，原文件备份为 `*.pre-comb`；已打过补丁的文件会跳过，所以用旧版补丁打过的环境重新运行一次即可补上新增的文件，然后重启服务；旧版补丁下测得的 mtp 组 `comb_N*` 结果无效，先移到 `invalid/` 再测，不要用 `RESUME=1` 续在上面）：
+- **comb 补丁**：对实验用的 SGLang 运行一次（只需一次，原文件备份为 `*.pre-comb`；已打过的修改会跳过，所以用旧版补丁打过的环境重新运行一次即可补上新增的修改，原始备份保留，然后重启服务；旧版补丁下测得的 mtp 组 `comb_N*` 结果无效，先移到 `invalid/` 再测，不要用 `RESUME=1` 续在上面）：
   ```bash
   SRT=$(${PY:-python} -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')/srt
   ${PY:-python} ../spec_research/comb_patch.py $SRT
@@ -189,6 +189,7 @@ python summarize.py results_eagle.jsonl --by-cat
 | `port 30000 busy` | 上一个服务没退出，或他人占用 | 只处理自己启动的进程；他人占用则换端口：`PORT=30010` |
 | mtp 组 tree 启动或运行时报错，提及 topk / GDN / mamba / `retrieve_parent_token` | 混合线性注意力的树形验证路径不支持当前配置（0.5.23 已在 1×A100 上实测 Qwen3.5-35B-A3B 的 tree_N8 / tree_N3 可用，bs=1；更大 bs、TP=8 未测） | **不要改代码绕过**；记录报错原文。`losing_bs.py` 会对这些 bs 报 `cannot judge` 而不再缩小 budget；mtp 组报告 ar 与 chain |
 | mtp 组 `srv_max_running` 小于 bs | 混合模型的 mamba 状态缓存限制了并发 | 记录日志开头的 `max_running_requests` 相关行，报告；不要改 mamba 相关参数 |
+| comb 服务启动时 `RuntimeError: comb (SGLANG_COMB_K=...) verifies a tree ... target attention backend [...]` | comb 以 topk=1 启动却验证一棵树，只有 FlashInfer 后端在 topk=1 时仍按树掩码验证；fa3（H100 等 Hopper 卡上 topk=1 时的默认后端）不读树掩码，验证结果是错的 | 服务端命令加 `--attention-backend flashinfer`（`run_all.sh` 可通过 `EXTRA` 传入），报告中注明；不要改补丁绕过检查 |
 | comb 服务启动时 `AssertionError: comb drafts a chain` 或 `comb is greedy-only` | comb 只支持 `--speculative-eagle-topk 1` 和 greedy | 由脚本自动设置，正常不会出现；出现说明命令被改动，恢复原命令 |
 | mtp 组 comb 启动或运行时报错 | comb 走树形验证路径，与上面 mtp 组 tree 的限制相同（四个文件都打上补丁后 mtp 冒烟已通过；若 comb 的 `accept_len` 低于 chain，或输出 token 数明显多于 chain，先按第 4 节检查补丁是否完整） | 同 mtp 组 tree 的处理：**不要改代码绕过**，记录报错原文，报告中注明；不影响缩小 budget 的判定 |
 | ModelScope 下载中断 | 网络 | 脚本自带 3 次重试；仍失败则重跑 `dl_models.sh`（续传） |
