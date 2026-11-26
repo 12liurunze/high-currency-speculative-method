@@ -4,35 +4,40 @@
 # comb: the drafter runs the plain topk=1 chain (trunk); the top-K of every draft distribution along the trunk
 # is kept, trunk siblings become leaves, and the top-B nodes by cumulative draft score (B = num_steps, the same
 # verify width as the chain) are verified as a tree.
-# Originals are saved as *.pre-comb. Files that already contain their edits are skipped, so re-running on a runtime
-# patched by an older version of this script only adds what that version did not cover. Nothing is written unless
-# every file matches.
+# Originals are saved as *.pre-comb. Edits already present are skipped, so re-running on a runtime patched by an
+# older version of this script only adds what that version did not cover (keeping the backup of the stock file).
+# Nothing is written unless every remaining edit matches.
 # Usage: python comb_patch.py /home/lrz/AI_infra/experiments/runtime/sglang/srt
 import os, shutil, sys
 
 SRT = sys.argv[1]
 
 
-pending = []  # (rel, path, patched source), written together by apply()
+pending = []  # (rel, path, patched source, stock), written together by apply()
 
 
 def patch(rel, edits):
     path = os.path.join(SRT, rel)
     src = open(path).read()
-    if all(new in src for _, new in edits):
+    todo = [(old, new) for old, new in edits if new not in src]
+    if not todo:
         print(f"skip {rel}: already patched")
         return
-    for old, new in edits:
+    # none of the edits present: a stock file, whose backup replaces any stale .pre-comb; otherwise the file was
+    # patched by an older version of this script and its .pre-comb already holds the stock original
+    stock = len(todo) == len(edits)
+    for old, new in todo:
         n = src.count(old)
         if n != 1:
             sys.exit(f"{rel}: expected 1 match, found {n}:\n{old}")
         src = src.replace(old, new)
-    pending.append((rel, path, src))
+    pending.append((rel, path, src, stock))
 
 
 def apply():
-    for rel, path, src in pending:
-        shutil.copy2(path, path + ".pre-comb")
+    for rel, path, src, stock in pending:
+        if stock or not os.path.exists(path + ".pre-comb"):
+            shutil.copy2(path, path + ".pre-comb")
         # replace instead of writing in place: installers such as uv hard-link files to a shared cache
         shutil.copy2(path, path + ".comb-tmp")
         with open(path + ".comb-tmp", "w") as f:
@@ -159,6 +164,53 @@ patch("speculative/eagle_worker_v2.py", [
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
             metadata_ready_pre_pad=False,'''),
+    # comb runs with --speculative-eagle-topk 1 but verifies a tree. Attention backends that pick the chain path from
+    # that flag verify it wrongly: fa3 (the default on Hopper, chosen there precisely because topk == 1) neither fills
+    # nor reads the tree mask and runs target verify as causal attention, so siblings see each other. Stop the server
+    # unless the target backend is one whose tree verify is checked for comb. Inserted in front of
+    # _comb_draft_forward, which runs during draft CUDA-graph capture (or on the first draft without graphs), i.e.
+    # after the target backends exist and before any request is served.
+    ('''    def _comb_draft_forward(self, forward_batch: ForwardBatch):
+''',
+     '''    # target attention backends that apply the tree mask in target verify even when the server runs with topk == 1
+    COMB_TREE_VERIFY_BACKENDS = ("FlashInferAttnBackend",)
+
+    def _comb_check_attn_backend(self):
+        if getattr(self, "_comb_backend_checked", False):
+            return
+        # descend through wrappers: prefill/decode split, and the full-attention part of hybrid linear-attention
+        # models (their linear layers are covered by the hybrid_linear_attn_backend.py edit)
+        leaves, stack, seen = [], [self.target_worker.model_runner.attn_backend], set()
+        while stack:
+            backend = stack.pop()
+            if backend is None or id(backend) in seen:
+                continue
+            seen.add(id(backend))
+            parts = [getattr(backend, a, None) for a in ("prefill_backend", "decode_backend", "full_attn_backend")]
+            parts = [b for b in parts if b is not None]
+            if parts:
+                stack.extend(parts)
+            else:
+                leaves.append(type(backend).__name__)
+        unsupported = sorted({n for n in leaves if n not in self.COMB_TREE_VERIFY_BACKENDS})
+        if not leaves or unsupported:
+            raise RuntimeError(
+                f"comb (SGLANG_COMB_K={self.comb_k}) verifies a tree under --speculative-eagle-topk 1, but the "
+                f"target attention backend {unsupported or leaves} is not one whose tree verify works with "
+                f"topk == 1 (fa3 skips the tree mask). Supported: {list(self.COMB_TREE_VERIFY_BACKENDS)}; "
+                f"start the server with --attention-backend flashinfer."
+            )
+        self._comb_backend_checked = True
+
+    def _comb_checked(fn):  # decorator: check the target attention backend before the first comb draft
+        def wrapper(self, *args, **kwargs):
+            self._comb_check_attn_backend()
+            return fn(self, *args, **kwargs)
+        return wrapper
+
+    @_comb_checked
+    def _comb_draft_forward(self, forward_batch: ForwardBatch):
+'''),
 ])
 
 # Draft decode CUDA graph: the captured draft_forward dispatches to _comb_draft_forward, which reads K root
