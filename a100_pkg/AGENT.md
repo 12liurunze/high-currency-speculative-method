@@ -75,13 +75,14 @@
 
 - 优先使用机器上已有的、满足要求的环境；否则在**独立 venv** 中安装 `sglang==0.5.23`（不要改系统 Python）。驱动的 CUDA 版本低于 torch 编译版本时，按 sglang 官方安装说明选对应 CUDA 版本的 wheel。
 - 必须包含 `qwen3_5.py` / `qwen3_5_mtp.py`（`check_env.sh` 会检查）。sglang 版本不是 0.5.23 时可以继续，但必须写进报告。
-- **comb 补丁**：对实验用的 SGLang 运行一次（只需一次，原文件备份为 `*.pre-comb`，重复运行会拒绝）：
+- **comb 补丁**：对实验用的 SGLang 运行一次（只需一次，原文件备份为 `*.pre-comb`；已打过补丁的文件会跳过，所以用旧版补丁打过的环境重新运行一次即可补上新增的文件，然后重启服务；旧版补丁下测得的 mtp 组 `comb_N*` 结果无效，先移到 `invalid/` 再测，不要用 `RESUME=1` 续在上面）：
   ```bash
   SRT=$(${PY:-python} -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')/srt
   ${PY:-python} ../spec_research/comb_patch.py $SRT
-  grep -c SGLANG_COMB_K $SRT/speculative/eagle_worker_v2.py   # 应 ≥ 1
+  grep -c SGLANG_COMB_K $SRT/speculative/eagle_worker_v2.py $SRT/layers/attention/hybrid_linear_attn_backend.py $SRT/mem_cache/memory_pool.py   # 每个都应 ≥ 1
+  grep -c comb_k $SRT/speculative/eagle_draft_cuda_graph_runner.py   # 应 ≥ 1
   ```
-  补丁修改 `speculative/eagle_worker_v2.py` 和 `speculative/eagle_draft_cuda_graph_runner.py`；每处修改要求原文件中恰好匹配一次，报 `expected 1 match` 说明 SGLang 版本不同，停止并报告，不要手动改代码。CUDA graph 与 overlap 调度都可正常开启（`comb_patch.py` 开头注释里要求关闭二者是早期版本的限制，已过时）。
+  补丁修改 `speculative/eagle_worker_v2.py`、`speculative/eagle_draft_cuda_graph_runner.py`、`layers/attention/hybrid_linear_attn_backend.py` 和 `mem_cache/memory_pool.py`（后两个让 Qwen3.5 的线性注意力层按树验证，缺少时 mtp 组 comb 的输出是错的）；每处修改要求原文件中恰好匹配一次，报 `expected 1 match` 说明 SGLang 版本不同，停止并报告，不要手动改代码。CUDA graph 与 overlap 调度都可正常开启（`comb_patch.py` 开头注释里要求关闭二者是早期版本的限制，已过时）。
 - 代理、镜像、`LD_LIBRARY_PATH` 等机器相关的环境变量写进本目录的 `env.sh`（各脚本会自动 `source`）；用的不是默认 `python` 时设置 `PY=/path/to/venv/bin/python`。
 
 ## 5. 执行步骤
@@ -189,7 +190,7 @@ python summarize.py results_eagle.jsonl --by-cat
 | mtp 组 tree 启动或运行时报错，提及 topk / GDN / mamba / `retrieve_parent_token` | 混合线性注意力的树形验证路径不支持当前配置（0.5.23 已在 1×A100 上实测 Qwen3.5-35B-A3B 的 tree_N8 / tree_N3 可用，bs=1；更大 bs、TP=8 未测） | **不要改代码绕过**；记录报错原文。`losing_bs.py` 会对这些 bs 报 `cannot judge` 而不再缩小 budget；mtp 组报告 ar 与 chain |
 | mtp 组 `srv_max_running` 小于 bs | 混合模型的 mamba 状态缓存限制了并发 | 记录日志开头的 `max_running_requests` 相关行，报告；不要改 mamba 相关参数 |
 | comb 服务启动时 `AssertionError: comb drafts a chain` 或 `comb is greedy-only` | comb 只支持 `--speculative-eagle-topk 1` 和 greedy | 由脚本自动设置，正常不会出现；出现说明命令被改动，恢复原命令 |
-| mtp 组 comb 启动或运行时报错 | comb 走树形验证路径，与上面 mtp 组 tree 的限制相同（未在 Qwen3.5 混合线性注意力上测过） | 同 mtp 组 tree 的处理：**不要改代码绕过**，记录报错原文，报告中注明；不影响缩小 budget 的判定 |
+| mtp 组 comb 启动或运行时报错 | comb 走树形验证路径，与上面 mtp 组 tree 的限制相同（四个文件都打上补丁后 mtp 冒烟已通过；若 comb 的 `accept_len` 低于 chain，或输出 token 数明显多于 chain，先按第 4 节检查补丁是否完整） | 同 mtp 组 tree 的处理：**不要改代码绕过**，记录报错原文，报告中注明；不影响缩小 budget 的判定 |
 | ModelScope 下载中断 | 网络 | 脚本自带 3 次重试；仍失败则重跑 `dl_models.sh`（续传） |
 | 服务停不掉 / GPU 显存未释放 | TP worker 残留 | `run_all.sh` 按进程组停止并等待退出；仍有残留时只 kill 自己启动的进程（`ps -eo pid,pgid,args | grep sglang` 核对） |
 
